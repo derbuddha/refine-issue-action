@@ -1,0 +1,139 @@
+name: 'Refine Issue with LLM'
+description: 'Reads a repository (READMEs, tree, AGENTS.md, manifests) and writes a project-aware, detailed description into a delimited section of the issue body.'
+author: 'Markus'
+
+branding:
+  icon: 'edit-3'
+  color: 'purple'
+
+inputs:
+  issue-llm-base-url:
+    description: 'OpenAI-compatible base URL, including the API version (e.g. https://llm.example.com/v1). "/chat/completions" is appended automatically.'
+    required: true
+  issue-llm-model:
+    description: 'Model name as accepted by the endpoint.'
+    required: true
+  issue-llm-token:
+    description: 'Bearer token for the OpenAI-compatible endpoint.'
+    required: true
+
+  forge-token:
+    description: 'Gitea token used to read and update the issue. Needs issue write scope.'
+    required: true
+  forge-url:
+    description: 'Base URL of the Gitea instance. Empty = the server URL of the current run.'
+    required: false
+    default: ''
+  repository:
+    description: 'owner/repo to operate on. Empty = the current repository.'
+    required: false
+    default: ''
+  issue-number:
+    description: 'Issue index to refine. Empty = the issue of the triggering event.'
+    required: false
+    default: ''
+
+  require-label:
+    description: 'If set, the action exits early unless the issue currently carries this label.'
+    required: false
+    default: 'refine-issue-agent'
+  remove-label:
+    description: >-
+      Remove require-label from the issue after a successful update. Off by
+      default: the removal is itself a label event, so Gitea starts (and then
+      skips) a run of every label-triggered workflow for it. Set to true to make
+      the label a one-shot button that can simply be re-applied to regenerate.
+    required: false
+    default: 'false'
+
+  section-begin:
+    description: 'Line that opens the generated section in the issue body. Matched exactly; an existing section between the markers is replaced. Rendered invisibly by Gitea.'
+    required: false
+    default: '<!-- agent:begin -->'
+  section-end:
+    description: 'Line that closes the generated section.'
+    required: false
+    default: '<!-- agent:end -->'
+
+  max-context-chars:
+    description: 'Upper bound on the repository context handed to the model.'
+    required: false
+    default: '60000'
+  max-file-chars:
+    description: 'Upper bound per individual context file.'
+    required: false
+    default: '8000'
+  max-tree-files:
+    description: 'Maximum number of paths listed in the file tree section.'
+    required: false
+    default: '400'
+  max-tokens:
+    description: 'max_tokens for the completion request.'
+    required: false
+    default: '65536'
+  temperature:
+    description: 'Sampling temperature.'
+    required: false
+    default: '0.2'
+  llm-timeout:
+    description: 'curl timeout in seconds for the completion request.'
+    required: false
+    default: '600'
+  working-directory:
+    description: 'Checkout directory to analyse.'
+    required: false
+    default: '.'
+
+outputs:
+  skipped:
+    description: 'true when the run exited early because the required label was missing.'
+    value: ${{ steps.refine.outputs.skipped }}
+  issue-url:
+    description: 'HTML URL of the updated issue.'
+    value: ${{ steps.refine.outputs.issue-url }}
+  error:
+    description: 'Failure reason when skipped is false and no issue-url is produced.'
+    value: ${{ steps.refine.outputs.error }}
+
+runs:
+  using: composite
+  steps:
+    - name: Ensure curl and jq
+      shell: bash
+      run: |
+        need=""
+        command -v curl >/dev/null || need="$need curl"
+        command -v jq   >/dev/null || need="$need jq"
+        if [ -n "$need" ]; then
+          if command -v apt-get >/dev/null; then
+            apt-get update -qq && apt-get install -y -qq $need
+          elif command -v apk >/dev/null; then
+            apk add --no-cache $need
+          else
+            echo "Missing:$need and no known package manager."; exit 1
+          fi
+        fi
+
+    - name: Refine the issue
+      id: refine
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        ISSUE_LLM_BASE_URL: ${{ inputs.issue-llm-base-url }}
+        ISSUE_LLM_MODEL: ${{ inputs.issue-llm-model }}
+        ISSUE_LLM_TOKEN: ${{ inputs.issue-llm-token }}
+        FORGE_TOKEN: ${{ inputs.forge-token }}
+        FORGE_URL: ${{ inputs.forge-url }}
+        REPOSITORY: ${{ inputs.repository }}
+        ISSUE_NUMBER: ${{ inputs.issue-number }}
+        REQUIRE_LABEL: ${{ inputs.require-label }}
+        REMOVE_LABEL: ${{ inputs.remove-label }}
+        SECTION_BEGIN: ${{ inputs.section-begin }}
+        SECTION_END: ${{ inputs.section-end }}
+        MAX_CONTEXT_CHARS: ${{ inputs.max-context-chars }}
+        MAX_FILE_CHARS: ${{ inputs.max-file-chars }}
+        MAX_TREE_FILES: ${{ inputs.max-tree-files }}
+        MAX_TOKENS: ${{ inputs.max-tokens }}
+        TEMPERATURE: ${{ inputs.temperature }}
+        LLM_TIMEOUT: ${{ inputs.llm-timeout }}
+      run: bash "${{ github.action_path }}/refine-issue.sh"
