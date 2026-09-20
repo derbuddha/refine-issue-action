@@ -55,6 +55,41 @@ inputs:
     required: false
     default: '<!-- agent:end -->'
 
+  include-attachments:
+    description: >-
+      Fetch the files attached to the issue (screenshots, logs, patches) over
+      the Gitea API and hand them to the model. Attachments are not part of the
+      issue body, so without this they are invisible to the refiner.
+    required: false
+    default: 'true'
+  include-comment-attachments:
+    description: 'Also scan the issue comments for attachments.'
+    required: false
+    default: 'true'
+  attachment-vision:
+    description: >-
+      Send image attachments as image_url content parts. Requires a
+      vision-capable issue-llm-model; set to false for a text-only model, which
+      then only sees the attachment file names.
+    required: false
+    default: 'true'
+  max-attachments:
+    description: 'Maximum number of attachments downloaded per issue.'
+    required: false
+    default: '10'
+  max-attachment-chars:
+    description: 'Upper bound per inlined text attachment.'
+    required: false
+    default: '8000'
+  max-attachment-bytes:
+    description: 'Images larger than this are listed by name only (base64 inflates them by ~33%).'
+    required: false
+    default: '4000000'
+  max-comments:
+    description: 'Maximum number of comments scanned for attachments.'
+    required: false
+    default: '20'
+
   max-context-chars:
     description: 'Upper bound on the repository context handed to the model.'
     required: false
@@ -130,6 +165,13 @@ runs:
         REMOVE_LABEL: ${{ inputs.remove-label }}
         SECTION_BEGIN: ${{ inputs.section-begin }}
         SECTION_END: ${{ inputs.section-end }}
+        INCLUDE_ATTACHMENTS: ${{ inputs.include-attachments }}
+        INCLUDE_COMMENT_ATTACHMENTS: ${{ inputs.include-comment-attachments }}
+        ATTACHMENT_VISION: ${{ inputs.attachment-vision }}
+        MAX_ATTACHMENTS: ${{ inputs.max-attachments }}
+        MAX_ATTACHMENT_CHARS: ${{ inputs.max-attachment-chars }}
+        MAX_ATTACHMENT_BYTES: ${{ inputs.max-attachment-bytes }}
+        MAX_COMMENTS: ${{ inputs.max-comments }}
         MAX_CONTEXT_CHARS: ${{ inputs.max-context-chars }}
         MAX_FILE_CHARS: ${{ inputs.max-file-chars }}
         MAX_TREE_FILES: ${{ inputs.max-tree-files }}

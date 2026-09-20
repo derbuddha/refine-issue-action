@@ -182,6 +182,39 @@ Re-running is therefore idempotent: the section is replaced, never stacked. Any 
 is exact whole-line, and the model is instructed not to emit HTML comments — any marker lines
 that slip through are filtered before the body is assembled.
 
+### Issue attachments
+
+Files dropped on an issue are **not** part of the issue body — Gitea stores them separately and
+leaves only a `/attachments/<uuid>` link (or an `![](...)` image) behind. The refiner would never
+see them without an explicit fetch, so when `include-attachments` is `true` (the default) it
+calls `GET /repos/{owner}/{repo}/issues/{index}/assets` and, if `include-comment-attachments`
+is also `true`, follows that with `GET /issues/{index}/comments` and
+`GET /issues/comments/{id}/assets` for each of the first `max-comments` comments. Attachments
+are de-duplicated by the order they appear and capped at `max-attachments` total.
+
+Each attachment is then handled by kind:
+
+| kind | detected by extension | what the model sees |
+| --- | --- | --- |
+| image (`.png`, `.jpg`/`.jpeg`, `.gif`, `.webp`) | suffix, lower-cased | base64 data-URL as an `image_url` content part, **if** `attachment-vision` is `true`; otherwise only the file name is logged. Images larger than `max-attachment-bytes` are listed by name only — base64 inflates them by ~33%, and a multi-MB request body is rarely worth it. |
+| text-ish (`.txt`, `.md`, `.log`, `.json`, `.yaml`, `.yml`, `.csv`, `.tsv`, `.diff`, `.patch`, `.xml`, `.html`, `.ini`, `.toml`, `.conf`, `.cfg`, `.sh`, `.py`, `.js`, `.ts`, `.sql`, `.go`, `.rs`, `.java`, `.c`, `.h`, `.hpp`, `.cpp`) | suffix, lower-cased | inlined under a `#### Attachment: <name>` heading, capped at `max-attachment-chars`, UTF-8-scrubbed with `iconv -c` so a half-cut multi-byte character does not poison the request |
+| anything else | — | listed by name and byte count only; the bytes never leave the runner |
+
+Text inlining happens **only** when there is at least one image to send. In that case the user
+message becomes a multimodal content array — the prompt first, then one `image_url` part per
+image. With no images the request body is unchanged: a plain `string` `user.content`, which is
+what every OpenAI-compatible endpoint has always accepted. The model is told to read error
+text, stack traces and UI details straight out of the attachments and to name the source
+attachment when it does — so a "see the screenshot" hand-wave in the original body becomes
+"the `traceback.png` shows a `KeyError` on the `/api/...` endpoint" in the generated section.
+
+Two Gitea quirks are handled transparently. Issue assets on Gitea ≤ 1.21 come back with a
+`browser_download_url` shaped like a release asset (`.../api/repos/<o>/<r>/releases/0/assets/<id>`),
+which 404s — the script falls back to the stable web route `${FORGE_URL}/attachments/<uuid>`
+whenever the reported URL is missing or has that shape. And the per-attachment `curl` follows
+redirects (`-L`) but lets curl drop the `Authorization` header on a cross-host hop by itself,
+which is what object-storage backends want.
+
 ### When the model returns nothing useful
 
 When the cleanup pipeline (think-block strip + marker filter) leaves the refined section empty,
@@ -233,6 +266,13 @@ workflow) if you would rather have the one-click re-run and live with the extra 
 | `remove-label` | `false` | Keeps the label on the issue after a successful run. Set to `true` to drop it, which makes the label a one-shot button — at the cost of an extra label event, and with it a skipped run of every label-triggered workflow. |
 | `section-begin` | `<!-- agent:begin -->` | Opening marker line. Invisible when rendered. |
 | `section-end` | `<!-- agent:end -->` | Closing marker line. |
+| `include-attachments` | `true` | Fetch the files attached to the issue (screenshots, logs, patches) over the Gitea API and hand them to the model. Attachments are not part of the issue body, so without this they are invisible to the refiner. |
+| `include-comment-attachments` | `true` | Also scan the issue comments for attachments — screenshots are very often added in a follow-up comment rather than on the issue itself. |
+| `attachment-vision` | `true` | Send image attachments as `image_url` content parts. Requires a vision-capable `issue-llm-model`; set to `false` for a text-only model, which then only sees the attachment file names. |
+| `max-attachments` | `10` | Maximum number of attachments downloaded per issue (issue assets + comment assets combined). |
+| `max-attachment-chars` | `8000` | Per-file character cap for text attachments inlined into the prompt (`.txt`, `.md`, `.log`, `.json`, `.yaml`, `.csv`, `.diff`, `.patch`, `.xml`, `.html`, `.ini`, `.toml`, `.conf`, `.cfg`, `.sh`, `.py`, `.js`, `.ts`, `.sql`, `.go`, `.rs`, `.java`, `.c`, `.h`, `.hpp`, `.cpp`). |
+| `max-attachment-bytes` | `4000000` | Images larger than this are listed by name only — base64 inflation (~33%) plus a multimodal request body are not worth sending huge screenshots. |
+| `max-comments` | `20` | Maximum number of comments scanned for attachments. |
 | `max-context-chars` | `60000` | Total repository context budget. |
 | `max-file-chars` | `8000` | Per-file budget. |
 | `max-tree-files` | `400` | Paths listed in the tree section. |

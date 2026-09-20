@@ -77,6 +77,26 @@ REQUIRE_LABEL="${REQUIRE_LABEL-refine-issue-agent}"
 # click to re-run and keeps the list readable.
 REMOVE_LABEL="${REMOVE_LABEL:-false}"
 
+# --- issue attachments -------------------------------------------------------
+# Files dropped on an issue are NOT part of the issue body: Gitea stores them
+# separately and leaves only a /attachments/<uuid> link (or an ![](...) image)
+# behind. They have to be fetched over the API or the model never sees them.
+INCLUDE_ATTACHMENTS="${INCLUDE_ATTACHMENTS:-true}"
+# Also scan the issue comments for attachments — screenshots are very often
+# added in a follow-up comment rather than on the issue itself.
+INCLUDE_COMMENT_ATTACHMENTS="${INCLUDE_COMMENT_ATTACHMENTS:-true}"
+MAX_COMMENTS="${MAX_COMMENTS:-20}"
+MAX_ATTACHMENTS="${MAX_ATTACHMENTS:-10}"
+# Text-ish attachments are inlined into the prompt up to this many characters.
+MAX_ATTACHMENT_CHARS="${MAX_ATTACHMENT_CHARS:-8000}"
+# Images are base64-inlined, which grows them by ~33%; anything bigger than
+# this is listed by name only instead of blowing up the request.
+MAX_ATTACHMENT_BYTES="${MAX_ATTACHMENT_BYTES:-4000000}"
+# Send images as image_url content parts. Requires a VISION-capable model on
+# ISSUE_LLM_MODEL; set to false for a text-only model and screenshots are then
+# only mentioned by file name.
+ATTACHMENT_VISION="${ATTACHMENT_VISION:-true}"
+
 case "$ISSUE_LLM_BASE_URL" in
   */chat/completions) LLM_ENDPOINT="$ISSUE_LLM_BASE_URL" ;;
   *)                  LLM_ENDPOINT="${ISSUE_LLM_BASE_URL}/chat/completions" ;;
@@ -216,6 +236,131 @@ done < "$WORK/manifests.txt"
 
 log "Context assembled: $(ctx_used) chars (limit ${MAX_CONTEXT_CHARS})."
 
+# ------------------------------------------------------------ issue attachments
+ATT_MD="$WORK/attachments.md"          # markdown listing + inlined text files
+PARTS="$WORK/parts.ndjson"             # one JSON content part per image
+ATT_DIR="$WORK/att"
+mkdir -p "$ATT_DIR"
+: > "$ATT_MD"
+: > "$PARTS"
+
+# lower-case suffix tests; keep the two lists in sync with the README.
+att_mime() { # file name -> image mime type, empty when not an image
+  case "$(printf '%s' "$1" | tr 'A-Z' 'a-z')" in
+    *.png)        printf 'image/png'  ;;
+    *.jpg|*.jpeg) printf 'image/jpeg' ;;
+    *.gif)        printf 'image/gif'  ;;
+    *.webp)       printf 'image/webp' ;;
+    *)            printf ''           ;;
+  esac
+}
+
+att_is_text() {
+  case "$(printf '%s' "$1" | tr 'A-Z' 'a-z')" in
+    *.txt|*.md|*.log|*.json|*.yaml|*.yml|*.csv|*.tsv|*.diff|*.patch|*.xml|\
+    *.html|*.ini|*.toml|*.conf|*.cfg|*.sh|*.py|*.js|*.ts|*.sql|*.go|*.rs|\
+    *.java|*.c|*.h|*.hpp|*.cpp) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Gitea <= 1.21 returns a bogus browser_download_url for ISSUE assets — it
+# formats them with the release template, giving .../api/repos/<o>/<r>/releases/0/assets/<id>
+# (go-gitea/gitea#27204). The /attachments/<uuid> web route is stable across
+# versions, so fall back to it whenever the reported URL is missing or bogus.
+asset_rows() { # stdin: assets JSON array -> stdout: name<TAB>url<TAB>size
+  jq -r --arg base "$FORGE_URL" '
+    .[]?
+    | (.browser_download_url // "") as $u
+    | (if ($u == "") or ($u | test("/releases/0/assets/"))
+       then $base + "/attachments/" + (.uuid // "")
+       else $u end) as $url
+    | [ (.name // "attachment"), $url, (.size // 0) ] | @tsv'
+}
+
+if [ "$INCLUDE_ATTACHMENTS" = "true" ]; then
+  : > "$WORK/assets.tsv"
+
+  code="$(forge GET "/issues/${ISSUE_NUMBER}/assets" "$WORK/assets.json")"
+  if [ "$code" = "200" ]; then
+    asset_rows < "$WORK/assets.json" >> "$WORK/assets.tsv"
+  else
+    log "WARNING: GET /issues/${ISSUE_NUMBER}/assets returned HTTP ${code} — issue attachments skipped."
+  fi
+
+  if [ "$INCLUDE_COMMENT_ATTACHMENTS" = "true" ]; then
+    code="$(forge GET "/issues/${ISSUE_NUMBER}/comments" "$WORK/comments.json")"
+    if [ "$code" = "200" ]; then
+      jq -r '.[]?.id' "$WORK/comments.json" | head -n "$MAX_COMMENTS" > "$WORK/comment-ids.txt"
+      while IFS= read -r cid; do
+        [ -n "$cid" ] || continue
+        ccode="$(forge GET "/issues/comments/${cid}/assets" "$WORK/cassets.json")"
+        [ "$ccode" = "200" ] || continue
+        asset_rows < "$WORK/cassets.json" >> "$WORK/assets.tsv"
+      done < "$WORK/comment-ids.txt"
+    else
+      log "WARNING: GET comments returned HTTP ${code} — comment attachments skipped."
+    fi
+  fi
+
+  n=0
+  while IFS="$(printf '\t')" read -r aname aurl asize; do
+    [ -n "${aurl:-}" ] || continue
+    n=$(( n + 1 ))
+    if [ "$n" -gt "$MAX_ATTACHMENTS" ]; then
+      log "Attachment limit ${MAX_ATTACHMENTS} reached — remaining attachments ignored."
+      break
+    fi
+    # never let a remote file name escape the work directory
+    safe="$(printf '%s' "$aname" | tr -c 'A-Za-z0-9._-' '_')"
+    f="$ATT_DIR/${n}-${safe}"
+
+    # -L: Gitea may redirect to object storage. curl drops the Authorization
+    # header on a cross-host redirect by itself, which is what we want.
+    dcode="$(curl -sSL -o "$f" -w '%{http_code}' --max-time "$LLM_TIMEOUT" \
+      -H "Authorization: token ${FORGE_TOKEN}" "$aurl")"
+    if [ "$dcode" != "200" ]; then
+      log "WARNING: download of '${aname}' returned HTTP ${dcode} (${aurl})."
+      printf -- '- `%s` (%s bytes) — download failed (HTTP %s)\n' "$aname" "$asize" "$dcode" >> "$ATT_MD"
+      continue
+    fi
+    bytes="$(wc -c < "$f" | tr -d ' ')"
+    mime="$(att_mime "$aname")"
+
+    if [ -n "$mime" ] && [ "$ATTACHMENT_VISION" = "true" ]; then
+      if [ "$bytes" -gt "$MAX_ATTACHMENT_BYTES" ]; then
+        printf -- '- `%s` (image, %s bytes) — too large to send, not shown to the model\n' "$aname" "$bytes" >> "$ATT_MD"
+        log "Skipping image '${aname}': ${bytes} bytes exceeds MAX_ATTACHMENT_BYTES."
+        continue
+      fi
+      # busybox base64 has no -w; fall back to stripping the newlines.
+      base64 -w0 "$f" > "$f.b64" 2>/dev/null || base64 < "$f" | tr -d '\n' > "$f.b64"
+      { printf 'data:%s;base64,' "$mime"; cat "$f.b64"; } > "$f.dataurl"
+      # --rawfile, not --arg: a multi-MB data URL would blow past the kernel's
+      # 128 KiB per-argument limit if it were passed on the command line.
+      jq -n -c --rawfile u "$f.dataurl" \
+        '{ type: "image_url", image_url: { url: $u } }' >> "$PARTS"
+      printf -- '- `%s` (image, %s bytes) — included below as an image\n' "$aname" "$bytes" >> "$ATT_MD"
+    elif [ -n "$mime" ]; then
+      printf -- '- `%s` (image, %s bytes) — vision disabled, content not shown\n' "$aname" "$bytes" >> "$ATT_MD"
+    elif att_is_text "$aname"; then
+      printf -- '- `%s` (text, %s bytes)\n' "$aname" "$bytes" >> "$ATT_MD"
+      {
+        printf '\n#### Attachment: %s\n\n```\n' "$aname"
+        head -c "$MAX_ATTACHMENT_CHARS" "$f" | scrub_utf8
+        printf '\n```\n'
+      } >> "$ATT_MD"
+    else
+      printf -- '- `%s` (%s bytes) — binary attachment, content not sent\n' "$aname" "$bytes" >> "$ATT_MD"
+    fi
+  done < "$WORK/assets.tsv"
+
+  IMAGE_COUNT="$(wc -l < "$PARTS" | tr -d ' ')"
+  log "Attachments: ${n} found, ${IMAGE_COUNT} sent as images."
+else
+  IMAGE_COUNT=0
+fi
+
 # ---------------------------------------------------------------- build request
 SYSTEM_PROMPT='You are a senior engineer triaging issues for a specific software project.
 
@@ -224,6 +369,7 @@ Write a detailed, implementation-ready description of that issue, fitted to THIS
 
 Rules:
 - Ground every statement in the provided context. Never invent files, commands, endpoints or dependencies that are not visible in it.
+- The issue may carry attachments: logs and text files are inlined under "## Issue attachments", screenshots and other images are attached to this same message. Treat them as part of the report — read error text, stack traces and UI details out of them and use them, and say which attachment a finding came from.
 - Where the issue is ambiguous, state the assumption explicitly instead of guessing silently.
 - Use the projects own vocabulary, paths, tooling and conventions.
 - Keep the original intent. Do not widen the scope.
@@ -247,24 +393,54 @@ Use exactly these sections:
     "$ISSUE_NUMBER" "$AUTHOR" "$TITLE"
   cat "$WORK/body-trimmed.md"
   printf '\n"""\n'
+  if [ -s "$ATT_MD" ]; then
+    printf '\n\n## Issue attachments\n\n'
+    cat "$ATT_MD"
+  fi
 } > "$WORK/prompt.txt"
 
-jq -n \
-  --arg model "$ISSUE_LLM_MODEL" \
-  --arg system "$SYSTEM_PROMPT" \
-  --rawfile user "$WORK/prompt.txt" \
-  --argjson max_tokens "$MAX_TOKENS" \
-  --argjson temperature "$TEMPERATURE" \
-  '{
-     model: $model,
-     max_tokens: $max_tokens,
-     temperature: $temperature,
-     stream: false,
-     messages: [
-       { role: "system", content: $system },
-       { role: "user",   content: $user }
-     ]
-   }' > "$WORK/request.json"
+if [ "${IMAGE_COUNT:-0}" -gt 0 ]; then
+  # Multimodal form: the user message becomes an array of content parts, the
+  # prompt first and one image_url part per screenshot. Only taken when there
+  # is at least one image, so a text-only endpoint keeps the plain string
+  # payload it has always been sent.
+  jq -s -c '.' "$PARTS" > "$WORK/parts.json"
+  jq -n \
+    --arg model "$ISSUE_LLM_MODEL" \
+    --arg system "$SYSTEM_PROMPT" \
+    --rawfile user "$WORK/prompt.txt" \
+    --slurpfile images "$WORK/parts.json" \
+    --argjson max_tokens "$MAX_TOKENS" \
+    --argjson temperature "$TEMPERATURE" \
+    '{
+       model: $model,
+       max_tokens: $max_tokens,
+       temperature: $temperature,
+       stream: false,
+       messages: [
+         { role: "system", content: $system },
+         { role: "user",
+           content: ([ { type: "text", text: $user } ] + $images[0]) }
+       ]
+     }' > "$WORK/request.json"
+else
+  jq -n \
+    --arg model "$ISSUE_LLM_MODEL" \
+    --arg system "$SYSTEM_PROMPT" \
+    --rawfile user "$WORK/prompt.txt" \
+    --argjson max_tokens "$MAX_TOKENS" \
+    --argjson temperature "$TEMPERATURE" \
+    '{
+       model: $model,
+       max_tokens: $max_tokens,
+       temperature: $temperature,
+       stream: false,
+       messages: [
+         { role: "system", content: $system },
+         { role: "user",   content: $user }
+       ]
+     }' > "$WORK/request.json"
+fi
 
 log "Calling ${LLM_ENDPOINT} with model ${ISSUE_LLM_MODEL} ($(wc -c < "$WORK/request.json" | tr -d ' ') bytes)."
 
