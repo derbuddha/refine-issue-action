@@ -1,32 +1,20 @@
 name: Refine issue
-# .gitea/workflows/refine-issue.yaml — drop this into any repo whose issues
-# should be expanded into a project-aware description when they are labelled.
+# .gitea/workflows/refine-issue.yaml — expands a labelled issue into a
+# project-aware description. Label `refine-issue-agent` first, review the
+# result, then label `coder-agent` to have it implemented.
 #
-# run-name overrides the run title so it shows the ISSUE instead of main's
-# latest commit message. (If your Gitea version ignores run-name — see
-# go-gitea/gitea#34247 — the commit message will still show; that's the bug,
-# not this config.)
+# The action repos are fetched with actions/checkout and then called by local
+# path: `uses: <url>/...` is resolved before the job starts and cannot carry a
+# token, so it fails on a private action repo (go-gitea/gitea#26032, #27935).
+# The local path form works and gives us the action's outputs.
 #
-# The action repo is fetched, not `uses:`-ed. `uses: <url>/refine-issue-action`
-# only works on a repo the runner can read anonymously: Gitea resolves `uses:`
-# before the job starts and cannot take a token — an open upstream limitation
-# (go-gitea/gitea#26032, #27935), not something a syntax change fixes. So we
-# fetch the action with an action: actions/checkout can clone ANY repo on this
-# instance when given `repository` + `token`. No hand-rolled clone script.
-# If your action repo IS public, the shorter `uses:` form is commented out at
-# the bottom of the job.
-#
-# Token: the automatic per-job token is minted for THIS repository and will be
-# refused on the action repo, so ACTION_CLONE_TOKEN carries the fetch and the
-# job token is only a fallback for the day the action repo goes public.
-#
-# ACTION_CLONE_TOKEN:
-#   a PAT with read:repository scope, from an account that can see the action
-#   repo. Set it ONCE on the org so every repo inherits it.
-#   Gitea rejects secret names starting with GITEA_ or GITHUB_.
-#
-# Pairs with gitea/coder-agent-action: label `refine-issue-agent` first to get
-# a detailed description, review it, then label `coder-agent` to implement it.
+# Needs, ideally set ONCE on the org:
+#   ACTION_CLONE_TOKEN  secret   PAT with read:repository for the action repos
+#   ISSUE_LLM_TOKEN     secret   bearer token for the LLM endpoint
+#   ISSUE_LLM_BASE_URL  var      OpenAI-compatible base URL incl. /v1
+#   ISSUE_LLM_MODEL     var      model name
+#   MM_WEBHOOK_URL      secret/var  Mattermost incoming webhook (secret preferred)
+#   INTERNAL_NO_PROXY   var      hosts that bypass the proxy (optional)
 
 run-name: "Refine · issue #${{ gitea.event.issue.number }} — ${{ gitea.event.issue.title }}"
 
@@ -47,11 +35,6 @@ jobs:
     steps:
       # The repository being analysed. Without this there is nothing to read.
       - name: Check out this repository
-        # Absolute URL on purpose: it pins the fetch to your own mirror of
-        # actions/checkout (pull-mirrored from GitHub) regardless of the
-        # instance's [actions] DEFAULT_ACTIONS_URL. A bare `actions/checkout@v4`
-        # resolves to github.com unless that is set to `self` — an internet call
-        # you may not want.
         uses: https://gitea.example.com/actions/checkout@v4
 
       - name: Fetch the action
@@ -59,54 +42,43 @@ jobs:
         with:
           repository: gitea/refine-issue-action
           ref: main
-          # PAT first; the per-job token only works if the repo becomes public.
           token: ${{ secrets.ACTION_CLONE_TOKEN || secrets.GITEA_TOKEN }}
-          # Checked out beside the project, and skipped when the context is
-          # assembled — the model must not see the action as project code.
+          # Beside the project, and skipped when the context is assembled — the
+          # model must not see the action as project code.
           path: .action
-          # Don't leave the PAT in .action/.git/config.
           persist-credentials: false
-          # Only if the runner's GITHUB_SERVER_URL is wrong (e.g. Gitea behind
-          # a subpath — go-gitea/gitea#33629):
-          # github-server-url: https://gitea.example.com
+
+      - name: Fetch the notify action
+        uses: https://gitea.example.com/actions/checkout@v4
+        with:
+          repository: gitea/notify-workflow-action
+          ref: main
+          token: ${{ secrets.ACTION_CLONE_TOKEN || secrets.GITEA_TOKEN }}
+          path: .actions/notify-workflow-action
+          persist-credentials: false
 
       - name: Refine this issue
-        env:
-          # None of the three ISSUE_LLM_* values is configured per repo; the
-          # ISSUE_ prefix keeps them apart from any other LLM config on the
-          # instance. The two variables are admin-level (instance-wide):
-          # Site Administration -> Actions -> Variables (Gitea 1.24+). The
-          # token is a USER secret: User Settings -> Actions -> Secrets, which
-          # covers that user's own repositories -- a repo owned by an ORG needs
-          # it on the org too. Precedence is repo > org > user (secrets) and
-          # repo > org > admin (variables), so a single project can still
-          # override any of them by setting it on itself.
-          # The name is identical at every layer, so one grep traces a value
-          # from the Gitea setting through to the script.
-          ISSUE_LLM_BASE_URL: ${{ vars.ISSUE_LLM_BASE_URL }}
-          ISSUE_LLM_MODEL:    ${{ vars.ISSUE_LLM_MODEL }}
-          ISSUE_LLM_TOKEN:    ${{ secrets.ISSUE_LLM_TOKEN }}
-          FORGE_TOKEN:        ${{ secrets.GITEA_TOKEN }}   # automatic per-job token
-        # Flat layout: the script sits at the root of the action repo. curl and
-        # jq come from the composite wrapper we skipped, so check them here.
-        run: |
-          set -euo pipefail
-          need=""
-          command -v curl >/dev/null || need="$need curl"
-          command -v jq   >/dev/null || need="$need jq"
-          [ -z "$need" ] || { apt-get update -qq && apt-get install -y -qq $need; }
-          bash "$GITHUB_WORKSPACE/.action/refine-issue.sh"
+        id: refine
+        uses: ./.action
+        with:
+          issue-llm-base-url: ${{ vars.ISSUE_LLM_BASE_URL }}
+          issue-llm-model:    ${{ vars.ISSUE_LLM_MODEL }}
+          issue-llm-token:    ${{ secrets.ISSUE_LLM_TOKEN }}
+          forge-token:        ${{ secrets.GITEA_TOKEN }}   # automatic per-job token
 
-      # --- PUBLIC ACTION REPO? ------------------------------------------------
-      # Then the "Fetch the action" step and the one above collapse into this
-      # one — no PAT, and inputs instead of env vars (see action.yaml for the
-      # full list). The project checkout is still required.
-      #
-      # - name: Refine this issue
-      #   id: refine
-      #   uses: https://gitea.example.com/gitea/refine-issue-action.git@main
-      #   with:
-      #     issue-llm-base-url: ${{ vars.ISSUE_LLM_BASE_URL }}
-      #     issue-llm-model:    ${{ vars.ISSUE_LLM_MODEL }}
-      #     issue-llm-token:    ${{ secrets.ISSUE_LLM_TOKEN }}
-      #     forge-token:  ${{ secrets.GITEA_TOKEN }}
+      # always(): the message you actually want is the one about a failure.
+      # Suppressed when the action bailed out for a missing label.
+      - name: Notify result
+        if: always() && steps.refine.outputs.skipped != 'true'
+        uses: ./.actions/notify-workflow-action
+        with:
+          webhook_url: ${{ secrets.MM_WEBHOOK_URL || vars.MM_WEBHOOK_URL }}
+          status: ${{ job.status }}
+          title: "Refine ${{ job.status }} · ${{ gitea.repository }} #${{ gitea.event.issue.number }}"
+          text: ${{ gitea.event.issue.title }}
+          # issue-url is empty on failure, so fall back to the triggering issue.
+          link: ${{ steps.refine.outputs.issue-url || gitea.event.issue.html_url }}
+          fields: >-
+            [{"title":"Modell","value":"${{ vars.ISSUE_LLM_MODEL }}","short":true},
+             {"title":"Fehler","value":"${{ steps.refine.outputs.error || '—' }}","short":true}]
+          no_proxy: ${{ vars.INTERNAL_NO_PROXY }}
